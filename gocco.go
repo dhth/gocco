@@ -3,8 +3,8 @@
 // documentation generator. It produces HTML that displays your comments
 // alongside your code. Comments are passed through
 // [Markdown](http://daringfireball.net/projects/markdown/syntax), and code is
-// passed through [Pygments](http://pygments.org/) syntax highlighting.  This
-// page is the result of running Gocco against its own source file.
+// highlighted using [chroma](https://github.com/alecthomas/chroma). This page
+// is the result of running Gocco against its own source file.
 //
 // If you install Gocco, you can run it from the command-line:
 //
@@ -16,29 +16,25 @@
 //
 // The [source for Gocco](http://github.com/nikhilm/gocco) is available on
 // GitHub, and released under the MIT license.
-//
-// To install Gocco, first make sure you have [Pygments](http://pygments.org/)
-// Then, with the go tool:
-//
-//     go get github.com/nikhilm/gocco
 package main
 
 import (
 	"bytes"
 	"container/list"
 	"flag"
-	"github.com/russross/blackfriday"
-	"io"
-	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"text/template"
+
+	"github.com/alecthomas/chroma/v2/formatters/html"
+	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/alecthomas/chroma/v2/styles"
+	"github.com/russross/blackfriday"
 )
 
 // ## Types
@@ -66,17 +62,12 @@ type TemplateSection struct {
 
 // a `Language` describes a programming language
 type Language struct {
-	// the `Pygments` name of the language
+	// `chroma` name of the language
 	name string
 	// The comment delimiter
 	symbol string
 	// The regular expression to match the comment delimiter
 	commentMatcher *regexp.Regexp
-	// Used as a placeholder so we can parse back Pygments output
-	// and put the sections together
-	dividerText string
-	// The HTML equivalent
-	dividerHTML *regexp.Regexp
 }
 
 // a `TemplateData` is per-file
@@ -91,7 +82,8 @@ type TemplateData struct {
 	// Only generate the TOC is there is more than one file
 	// Go's templating system does not allow expressions in the
 	// template, so calculate it outside
-	Multiple bool
+	Multiple     bool
+	StyleClasses string
 }
 
 // a map of all the languages we know
@@ -103,9 +95,13 @@ var sources []string
 // absolute path to get resources
 var packageLocation string
 
-// Wrap the code in these
-const highlightStart = "<div class=\"highlight\"><pre>"
-const highlightEnd = "</pre></div>"
+const (
+	// Wrap the code in these
+	highlightStart = "<div class=\"highlight\"><pre>"
+	highlightEnd   = "</pre></div>"
+
+	chromaStyle = "catppuccin-latte"
+)
 
 // ## Main documentation generation functions
 
@@ -115,7 +111,7 @@ const highlightEnd = "</pre></div>"
 // The WaitGroup is used to signal we are done, so that the main
 // goroutine waits for all the sub goroutines
 func generateDocumentation(source string, wg *sync.WaitGroup) {
-	code, err := ioutil.ReadFile(source)
+	code, err := os.ReadFile(source)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -153,7 +149,7 @@ func parse(source string, code []byte) *list.List {
 			if hasCode {
 				// we need to save the existing documentation and text
 				// as a section and start a new section since code blocks
-				// have to be delimited before being sent to Pygments
+				// have to be delimited before being sent for syntax highlighting
 				save(docsText.Bytes(), codeText.Bytes())
 				hasCode = false
 				codeText.Reset()
@@ -172,42 +168,33 @@ func parse(source string, code []byte) *list.List {
 	return sections
 }
 
-// `highlight` pipes the source to Pygments, section by section
-// delimited by dividerText, then reads back the highlighted output,
-// searches for the delimiters and extracts the HTML version of the code
-// and documentation for each `Section`
+// `highlight` iterates through sections, and generates documentation
+// and code HTML for each. Syntax highlights for code are added using
+// chroma
 func highlight(source string, sections *list.List) {
 	language := getLanguage(source)
-	pygments := exec.Command("pygmentize", "-l", language.name, "-f", "html", "-O", "encoding=utf-8")
-	pygmentsInput, _ := pygments.StdinPipe()
-	pygmentsOutput, _ := pygments.StdoutPipe()
-	// start the process before we start piping data to it
-	// otherwise the pipe may block
-	pygments.Start()
-	for e := sections.Front(); e != nil; e = e.Next() {
-		pygmentsInput.Write(e.Value.(*Section).codeText)
-		if e.Next() != nil {
-			io.WriteString(pygmentsInput, language.dividerText)
-		}
+	lexer := lexers.Get(language.name)
+	if lexer == nil {
+		lexer = lexers.Fallback
 	}
-	pygmentsInput.Close()
-
-	buf := new(bytes.Buffer)
-	io.Copy(buf, pygmentsOutput)
-
-	output := buf.Bytes()
-	output = bytes.Replace(output, []byte(highlightStart), nil, -1)
-	output = bytes.Replace(output, []byte(highlightEnd), nil, -1)
+	style := styles.Get(chromaStyle)
+	if style == nil {
+		style = styles.Fallback
+	}
+	formatter := html.New(html.WithClasses(true))
 
 	for e := sections.Front(); e != nil; e = e.Next() {
-		index := language.dividerHTML.FindIndex(output)
-		if index == nil {
-			index = []int{len(output), len(output)}
+		var buf bytes.Buffer
+		iterator, err := lexer.Tokenise(nil, string(e.Value.(*Section).codeText))
+		if err != nil {
+			buf.Write(e.Value.(*Section).codeText)
+			continue
 		}
-
-		fragment := output[0:index[0]]
-		output = output[index[1]:]
-		e.Value.(*Section).CodeHTML = bytes.Join([][]byte{[]byte(highlightStart), []byte(highlightEnd)}, fragment)
+		err = formatter.Format(&buf, style, iterator)
+		if err != nil {
+			buf.Write(e.Value.(*Section).codeText)
+		}
+		e.Value.(*Section).CodeHTML = bytes.Join([][]byte{[]byte(highlightStart), []byte(highlightEnd)}, buf.Bytes())
 		e.Value.(*Section).DocsHTML = blackfriday.MarkdownCommon(e.Value.(*Section).docsText)
 	}
 }
@@ -230,10 +217,19 @@ func generateHTML(source string, sections *list.List) {
 		codeBuf := bytes.NewBuffer(sec.CodeHTML)
 		sectionsArray[i] = &TemplateSection{docsBuf.String(), codeBuf.String(), i + 1}
 	}
+
+	var styleBuf bytes.Buffer
+	style := styles.Get(chromaStyle)
+	if style == nil {
+		style = styles.Fallback
+	}
+	formatter := html.New(html.WithClasses(true))
+	_ = formatter.WriteCSS(&styleBuf, style)
+
 	// run through the Go template
-	html := goccoTemplate(TemplateData{title, sectionsArray, sources, len(sources) > 1})
+	html := goccoTemplate(TemplateData{title, sectionsArray, sources, len(sources) > 1, styleBuf.String()})
 	log.Println("gocco: ", source, " -> ", dest)
-	ioutil.WriteFile(dest, html, 0644)
+	os.WriteFile(dest, html, 0644)
 }
 
 func goccoTemplate(data TemplateData) []byte {
@@ -270,8 +266,8 @@ func setupLanguages() {
 	languages = make(map[string]*Language)
 	// you should add more languages here
 	// only the first two fields should change, the rest should
-	// be `nil, "", nil`
-	languages[".go"] = &Language{"go", "//", nil, "", nil}
+	// be `nil `
+	languages[".go"] = &Language{"go", "//", nil}
 }
 
 func setup() {
@@ -280,8 +276,6 @@ func setup() {
 	// create the regular expressions based on the language comment symbol
 	for _, lang := range languages {
 		lang.commentMatcher, _ = regexp.Compile("^\\s*" + lang.symbol + "\\s?")
-		lang.dividerText = "\n" + lang.symbol + "DIVIDER\n"
-		lang.dividerHTML, _ = regexp.Compile("\\n*<span class=\"c1?\">" + lang.symbol + "DIVIDER<\\/span>\\n*")
 	}
 }
 
@@ -298,7 +292,7 @@ func main() {
 	}
 
 	ensureDirectory("docs")
-	ioutil.WriteFile("docs/gocco.css", bytes.NewBufferString(Css).Bytes(), 0755)
+	os.WriteFile("docs/gocco.css", bytes.NewBufferString(Css).Bytes(), 0755)
 
 	wg := new(sync.WaitGroup)
 	wg.Add(flag.NArg())
